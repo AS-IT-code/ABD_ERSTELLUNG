@@ -1,0 +1,15 @@
+.env
+.git
+.gitignore
+.github
+__pycache__
+*.pyc
+.venv
+venv
+downloads
+*.pdf
+run.bat
+*.md
+.pytest_cache
+.idea
+.vscode

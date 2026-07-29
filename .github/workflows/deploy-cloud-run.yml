@@ -1,0 +1,57 @@
+name: Deploy to Cloud Run
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  REGION: ${{ vars.GCP_REGION || 'europe-west3' }}
+  SERVICE: ${{ vars.CLOUD_RUN_SERVICE || 'abd-erstellung-sync' }}
+  REPO: ${{ vars.ARTIFACT_REPO || 'abd-erstellung' }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Build and push image
+        run: |
+          set -euo pipefail
+          IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/${SERVICE}:${GITHUB_SHA}"
+          docker build -t "$IMAGE" -t "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/${SERVICE}:latest" .
+          docker push "$IMAGE"
+          docker push "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/${SERVICE}:latest"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - name: Deploy to Cloud Run
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: ${{ env.SERVICE }}
+          region: ${{ env.REGION }}
+          image: ${{ env.IMAGE }}
+          flags: >-
+            --allow-unauthenticated
+            --memory=1Gi
+            --cpu=1
+            --timeout=3600
+            --concurrency=1
+            --max-instances=1
+            --set-secrets=ZENDESK_SUBDOMAIN=ZENDESK_SUBDOMAIN:latest,ZENDESK_EMAIL=ZENDESK_EMAIL:latest,ZENDESK_API_TOKEN=ZENDESK_API_TOKEN:latest,Teams_ClientID=Teams_ClientID:latest,Teams_SECRETKey=Teams_SECRETKey:latest,AZURE_TENANT_ID=AZURE_TENANT_ID:latest,Teams_Teams_ID=Teams_Teams_ID:latest,Teams_Channels_ID=Teams_Channels_ID:latest,Teams_Drive_ID=Teams_Drive_ID:latest,Teams_Folder_ID=Teams_Folder_ID:latest,SYNC_API_KEY=SYNC_API_KEY:latest
