@@ -24,6 +24,8 @@ import requests
 from dotenv import load_dotenv
 
 SEARCH_TEXT = "ABD Erstellung"
+# Gunluk sync: sadece son 24 saatte guncellenen ticketlar (Zendesk 1000/page=11 limitini asmamak icin)
+SEARCH_WINDOW = "updated>24hours"
 PROCESSED_FILE = "processed_tickets.txt"
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
@@ -147,13 +149,18 @@ def pdf_name_from_subject(subject: str) -> str:
 
 def search_tickets(base: str, auth: tuple[str, str]) -> list[dict]:
     tickets: list[dict] = []
-    # subject icinde exact phrase
-    query = f'type:ticket subject:"{SEARCH_TEXT}"'
+    # subject + son 24 saat; processed listesi ayrica atlar
+    query = f'type:ticket subject:"{SEARCH_TEXT}" {SEARCH_WINDOW}'
     url = f"{base}/search.json"
-    params = {"query": query, "sort_by": "created_at", "sort_order": "desc"}
+    params = {"query": query, "sort_by": "updated_at", "sort_order": "desc"}
+    print(f"  Zendesk query: {query}")
 
     while url:
         resp = requests.get(url, auth=auth, params=params, timeout=60)
+        if resp.status_code == 422:
+            # Zendesk search offset limiti (~1000); son 24s ile nadir, yine de guvenli cik
+            print("  Uyari: Zendesk search 422 (pagination limiti) -> mevcut sonuclarla devam")
+            break
         resp.raise_for_status()
         data = resp.json()
         for item in data.get("results", []):
@@ -217,9 +224,9 @@ def run_sync() -> dict:
     processed = load_processed(token)
     print(f"  -> {len(processed)} ticket daha once islenmis")
 
-    print(f'Zendesk araniyor: subject icinde "{SEARCH_TEXT}"...')
+    print(f'Zendesk araniyor: subject "{SEARCH_TEXT}" + {SEARCH_WINDOW}...')
     tickets = search_tickets(zd_base, zd_auth)
-    print(f"  -> {len(tickets)} ticket bulundu")
+    print(f"  -> {len(tickets)} ticket (son 24s); processed olanlar atlanacak")
 
     uploaded = 0
     skipped = 0
