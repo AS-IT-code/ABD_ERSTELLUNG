@@ -24,10 +24,35 @@ import requests
 from dotenv import load_dotenv
 
 SEARCH_TEXT = "ABD Erstellung"
-# Gunluk sync: sadece son 24 saatte guncellenen ticketlar (Zendesk 1000/page=11 limitini asmamak icin)
-SEARCH_WINDOW = "updated>24hours"
 PROCESSED_FILE = "processed_tickets.txt"
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+
+
+def get_search_window() -> str:
+    """Env SEARCH_WINDOW varsa onu kullan; yoksa 2026-09-01'den itibaren (bekleyen ticketlar kacmasin)."""
+    explicit = os.getenv("SEARCH_WINDOW", "").strip().strip("'").strip('"')
+    if explicit:
+        return explicit
+    since = os.getenv("RECHECK_SINCE", "").strip().strip("'").strip('"')
+    if since:
+        return f"created>={since}"
+    # Processed'te olmayan (PDF bekleyen) ticketlar her gun tekrar bakilsin
+    return "created>=2026-09-01"
+
+
+def ignore_processed() -> bool:
+    """Sadece IGNORE_PROCESSED=true ise processed ATLANMAZ (zorla full reupload)."""
+    flag = os.getenv("IGNORE_PROCESSED", "").strip().strip("'").strip('"').lower()
+    return flag in ("1", "true", "yes")
+
+
+def normalize_ticket_id(value: object) -> str:
+    """Ticket id'yi sadece rakam olarak normalize et."""
+    s = str(value or "").strip()
+    if s.isdigit():
+        return s
+    digits = re.sub(r"\D", "", s)
+    return digits or s
 
 
 def require_env(name: str) -> str:
@@ -80,12 +105,83 @@ def graph_headers(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
-def drive_item_url(filename: str) -> str:
+def drive_item_url(filename: str, *, subfolder: str | None = None) -> str:
     drive_id = require_env("Teams_Drive_ID")
     folder_id = require_env("Teams_Folder_ID")
     # # ve bosluk URL'yi bozar; path segment encode edilmeli
-    encoded = quote(filename, safe="")
-    return f"{GRAPH_BASE}/drives/{drive_id}/items/{folder_id}:/{encoded}:"
+    encoded_name = quote(filename, safe="")
+    if subfolder:
+        encoded_folder = quote(subfolder, safe="")
+        return (
+            f"{GRAPH_BASE}/drives/{drive_id}/items/{folder_id}"
+            f":/{encoded_folder}/{encoded_name}:"
+        )
+    return f"{GRAPH_BASE}/drives/{drive_id}/items/{folder_id}:/{encoded_name}:"
+
+
+def month_folder_from_text(text: str) -> str | None:
+    """
+    'Auftrag 250926102929102450 ABD Erstellung' -> ilk 6 hane DDMMYY -> '2026-09'
+    """
+    match = re.search(r"(\d{6,})", text or "")
+    if not match:
+        return None
+    ddmmyy = match.group(1)[:6]
+    try:
+        dd = int(ddmmyy[0:2])
+        mm = int(ddmmyy[2:4])
+        yy = int(ddmmyy[4:6])
+    except ValueError:
+        return None
+    if not (1 <= mm <= 12 and 1 <= dd <= 31):
+        return None
+    yyyy = 2000 + yy if yy < 100 else yy
+    return f"{yyyy:04d}-{mm:02d}"
+
+
+def ensure_month_folder(token: str, yyyy_mm: str, cache: dict[str, str] | None = None) -> str:
+    """Teams_Folder_ID altinda YYYY-MM klasoru yoksa olustur, id don."""
+    if cache is not None and yyyy_mm in cache:
+        return cache[yyyy_mm]
+
+    drive_id = require_env("Teams_Drive_ID")
+    parent_id = require_env("Teams_Folder_ID")
+    encoded = quote(yyyy_mm, safe="")
+    get_url = f"{GRAPH_BASE}/drives/{drive_id}/items/{parent_id}:/{encoded}"
+    resp = requests.get(get_url, headers=graph_headers(token), timeout=60)
+    if resp.status_code == 200:
+        folder_id = resp.json()["id"]
+        if cache is not None:
+            cache[yyyy_mm] = folder_id
+        return folder_id
+
+    create_url = f"{GRAPH_BASE}/drives/{drive_id}/items/{parent_id}/children"
+    payload = {
+        "name": yyyy_mm,
+        "folder": {},
+        "@microsoft.graph.conflictBehavior": "fail",
+    }
+    create = requests.post(
+        create_url, headers={**graph_headers(token), "Content-Type": "application/json"},
+        json=payload, timeout=60,
+    )
+    if create.status_code in (200, 201):
+        folder_id = create.json()["id"]
+        print(f"  Ay klasoru olusturuldu: {yyyy_mm}")
+        if cache is not None:
+            cache[yyyy_mm] = folder_id
+        return folder_id
+
+    # Paralel kosuda biri olusturmus olabilir
+    if create.status_code in (409, 405):
+        resp2 = requests.get(get_url, headers=graph_headers(token), timeout=60)
+        resp2.raise_for_status()
+        folder_id = resp2.json()["id"]
+        if cache is not None:
+            cache[yyyy_mm] = folder_id
+        return folder_id
+
+    raise RuntimeError(f"Ay klasoru olusturulamadi ({yyyy_mm}): {create.status_code} {create.text[:300]}")
 
 
 def load_processed(token: str) -> set[str]:
@@ -96,14 +192,15 @@ def load_processed(token: str) -> set[str]:
     resp.raise_for_status()
     ids: set[str] = set()
     for line in resp.text.splitlines():
-        line = line.strip()
-        if line:
-            ids.add(line)
+        tid = normalize_ticket_id(line)
+        if tid:
+            ids.add(tid)
     return ids
 
 
 def save_processed(token: str, ticket_ids: set[str]) -> None:
-    content = "\n".join(sorted(ticket_ids, key=lambda x: int(x) if x.isdigit() else x)) + "\n"
+    normalized = {normalize_ticket_id(x) for x in ticket_ids if normalize_ticket_id(x)}
+    content = "\n".join(sorted(normalized, key=lambda x: int(x) if x.isdigit() else x)) + "\n"
     url = f"{drive_item_url(PROCESSED_FILE)}/content"
     headers = {
         **graph_headers(token),
@@ -113,8 +210,29 @@ def save_processed(token: str, ticket_ids: set[str]) -> None:
     resp.raise_for_status()
 
 
-def upload_file(token: str, local_path: Path, remote_name: str) -> None:
-    url = f"{drive_item_url(remote_name)}/content"
+def remote_file_exists(token: str, remote_name: str, *, month_folder: str | None = None) -> bool:
+    """Teams'te ayni isimli dosya var mi (yeniden yuklemeyi engelle)."""
+    url = f"{drive_item_url(remote_name, subfolder=month_folder)}"
+    resp = requests.get(url, headers=graph_headers(token), timeout=60)
+    return resp.status_code == 200
+
+
+def upload_file(
+    token: str,
+    local_path: Path,
+    remote_name: str,
+    *,
+    month_folder: str | None = None,
+    month_cache: dict[str, str] | None = None,
+) -> str:
+    """PDF'i Teams_Folder_ID[/YYYY-MM]/remote_name altina yukler. Donen: hedef path."""
+    if month_folder:
+        ensure_month_folder(token, month_folder, month_cache)
+        url = f"{drive_item_url(remote_name, subfolder=month_folder)}/content"
+        target = f"{month_folder}/{remote_name}"
+    else:
+        url = f"{drive_item_url(remote_name)}/content"
+        target = remote_name
     headers = {
         **graph_headers(token),
         "Content-Type": "application/pdf",
@@ -122,6 +240,7 @@ def upload_file(token: str, local_path: Path, remote_name: str) -> None:
     with local_path.open("rb") as f:
         resp = requests.put(url, headers=headers, data=f, timeout=300)
     resp.raise_for_status()
+    return target
 
 
 def sanitize_filename(name: str) -> str:
@@ -147,18 +266,17 @@ def pdf_name_from_subject(subject: str) -> str:
     return sanitize_filename(base)
 
 
-def search_tickets(base: str, auth: tuple[str, str]) -> list[dict]:
+def search_tickets(base: str, auth: tuple[str, str], window: str) -> list[dict]:
     tickets: list[dict] = []
-    # subject + son 24 saat; processed listesi ayrica atlar
-    query = f'type:ticket subject:"{SEARCH_TEXT}" {SEARCH_WINDOW}'
+    # subject + tarih penceresi; PDF yoksa processed'e yazilmaz (bekler)
+    query = f'type:ticket subject:"{SEARCH_TEXT}" {window}'
     url = f"{base}/search.json"
-    params = {"query": query, "sort_by": "updated_at", "sort_order": "desc"}
+    params = {"query": query, "sort_by": "created_at", "sort_order": "asc"}
     print(f"  Zendesk query: {query}")
 
     while url:
         resp = requests.get(url, auth=auth, params=params, timeout=60)
         if resp.status_code == 422:
-            # Zendesk search offset limiti (~1000); son 24s ile nadir, yine de guvenli cik
             print("  Uyari: Zendesk search 422 (pagination limiti) -> mevcut sonuclarla devam")
             break
         resp.raise_for_status()
@@ -167,7 +285,7 @@ def search_tickets(base: str, auth: tuple[str, str]) -> list[dict]:
             if item.get("result_type") == "ticket" or "subject" in item:
                 tickets.append(item)
         url = data.get("next_page")
-        params = None  # next_page already includes params
+        params = None
     return tickets
 
 
@@ -217,33 +335,44 @@ def run_sync() -> dict:
     _ = require_env("Teams_Drive_ID")
     _ = require_env("Teams_Folder_ID")
 
+    window = get_search_window()
+    skip_processed = not ignore_processed()
+
     print("Teams token aliniyor...")
     token = get_teams_token()
 
     print(f"Islenmis ticket listesi ({PROCESSED_FILE}) okunuyor...")
     processed = load_processed(token)
-    print(f"  -> {len(processed)} ticket daha once islenmis")
+    print(f"  -> {len(processed)} ticket daha once islenmis (bir daha yuklenmez)")
+    if not skip_processed:
+        print("  -> UYARI: IGNORE_PROCESSED=true — processed ATLANMIYOR, tekrar yukleme acik!")
+    else:
+        print("  -> processed skip AKTIF: listedeki ticketlar atlanacak")
 
-    print(f'Zendesk araniyor: subject "{SEARCH_TEXT}" + {SEARCH_WINDOW}...')
-    tickets = search_tickets(zd_base, zd_auth)
-    print(f"  -> {len(tickets)} ticket (son 24s); processed olanlar atlanacak")
+    print(f'Zendesk araniyor: subject "{SEARCH_TEXT}" + {window}...')
+    tickets = search_tickets(zd_base, zd_auth, window)
+    print(f"  -> {len(tickets)} ticket bulundu")
 
     uploaded = 0
     skipped = 0
+    already_exists = 0
     no_pdf = 0
+    waiting = 0
     errors = 0
     newly_processed: set[str] = set()
+    month_cache: dict[str, str] = {}
 
     with tempfile.TemporaryDirectory(prefix="abd_sync_") as tmp:
         tmp_dir = Path(tmp)
 
         for ticket in tickets:
-            ticket_id = str(ticket.get("id", "")).strip()
+            ticket_id = normalize_ticket_id(ticket.get("id", ""))
             subject = (ticket.get("subject") or "").strip()
             if not ticket_id:
                 continue
 
-            if ticket_id in processed:
+            # Daha once basariyla islenen ticket — bir daha atma
+            if skip_processed and ticket_id in processed:
                 skipped += 1
                 continue
 
@@ -253,31 +382,52 @@ def run_sync() -> dict:
                 pdfs = find_abd_pdfs(comments)
 
                 if not pdfs:
-                    print("  PDF (ABD) yok -> islenmis sayilacak")
-                    newly_processed.add(ticket_id)
-                    processed.add(ticket_id)
+                    print("  PDF (ABD) yok -> bekletiliyor (processed'e yazilmiyor)")
+                    waiting += 1
                     no_pdf += 1
                     continue
 
                 remote_name = pdf_name_from_subject(subject)
+                month_folder = month_folder_from_text(subject) or month_folder_from_text(remote_name)
+                if not month_folder:
+                    print("  Uyari: tarih (DDMMYY) okunamadi -> kok klasore yuklenecek")
+
+                any_uploaded = False
+                existed_here = False
                 for idx, pdf in enumerate(pdfs):
                     name = remote_name
                     if idx > 0:
                         stem = Path(remote_name).stem
                         name = sanitize_filename(f"{stem}_{idx + 1}.pdf")
 
+                    if remote_file_exists(token, name, month_folder=month_folder):
+                        print(f"  Zaten var, atlanıyor: {month_folder + '/' if month_folder else ''}{name}")
+                        already_exists += 1
+                        existed_here = True
+                        continue
+
                     local_path = tmp_dir / name
                     print(f"  Indiriliyor: {pdf['file_name']} -> {name}")
                     download_attachment(zd_auth, pdf["content_url"], local_path)
-                    print(f"  Teams'e yukleniyor: {name}")
-                    upload_file(token, local_path, name)
+                    target = upload_file(
+                        token,
+                        local_path,
+                        name,
+                        month_folder=month_folder,
+                        month_cache=month_cache,
+                    )
+                    print(f"  Teams'e yukleniyor: {target}")
                     uploaded += 1
+                    any_uploaded = True
 
+                # PDF hazirdi (yeni yukleme veya zaten vardi) -> processed'e yaz, bir daha bakma
                 newly_processed.add(ticket_id)
                 processed.add(ticket_id)
-            except Exception as exc:  # noqa: BLE001 - tek ticket hata verse devam et
+                if not any_uploaded and existed_here:
+                    print("  Dosyalar zaten klasordeydi -> processed olarak isaretlendi")
+            except Exception as exc:  # noqa: BLE001
                 errors += 1
-                print(f"  HATA (ticket atlandi): {exc}")
+                print(f"  HATA (ticket atlandi, processed'e yazilmiyor): {exc}")
                 continue
 
             if len(newly_processed) % 10 == 0:
@@ -285,22 +435,27 @@ def run_sync() -> dict:
                 print(f"  [checkpoint] processed_tickets.txt kaydedildi ({len(processed)} total)")
 
     if newly_processed:
-        print(f"\n{PROCESSED_FILE} guncelleniyor ({len(newly_processed)} yeni)...")
+        print(f"\n{PROCESSED_FILE} guncelleniyor ({len(newly_processed)} yeni basarili)...")
         save_processed(token, processed)
     else:
-        print("\nYeni islenen ticket yok, processed listesi ayni.")
+        print("\nYeni basarili upload yok; processed listesi (basarili olanlar) ayni.")
 
     summary = {
         "uploaded": uploaded,
-        "skipped": skipped,
-        "no_pdf": no_pdf,
+        "skipped_processed": skipped,
+        "already_exists_skipped": already_exists,
+        "no_pdf_waiting": waiting,
         "errors": errors,
         "newly_processed": len(newly_processed),
         "tickets_found": len(tickets),
+        "search_window": window,
+        "ignore_processed": not skip_processed,
+        "month_folders_used": sorted(month_cache.keys()),
     }
-    print("\n--- Ozet ---")
+    print("\n--- Akis 1 Ozet (ABD PDF -> Teams_Folder_ID/YYYY-MM) ---")
     for key, value in summary.items():
         print(f"{key}: {value}")
+
     return summary
 
 

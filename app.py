@@ -1,9 +1,9 @@
 """
 Cloud Run HTTP entrypoint.
 
-GET  /health  -> liveness
-POST /sync    -> ABD Erstellung sync calistir (Cloud Scheduler burayi cagirir)
-GET  /sync    -> ayni (manuel test icin)
+GET  /health     -> liveness
+POST /sync       -> Akis 1: ABD PDF -> Teams_Folder_ID
+POST /sync-dhl   -> Akis 2: zip -> ABDtoDHL + Zendesk (ayri Scheduler)
 
 Koruma: SYNC_API_KEY env varsa Header `X-API-Key` veya `?key=` zorunlu.
 """
@@ -55,9 +55,9 @@ def health():
 @app.route("/sync", methods=["GET", "POST"])
 @require_api_key
 def sync():
-    log.info("Sync basladi (remote=%s)", request.remote_addr)
+    """Akis 1: ABD PDF -> Teams_Folder_ID"""
+    log.info("Sync (ABD PDF) basladi (remote=%s)", request.remote_addr)
     try:
-        # Import burada: cold start'ta env kontrolu sync aninda yapilsin
         from abd_sync import run_sync
 
         result = run_sync()
@@ -65,6 +65,22 @@ def sync():
         return jsonify({"ok": True, **result}), 200
     except Exception as exc:  # noqa: BLE001
         log.error("Sync hata: %s\n%s", exc, traceback.format_exc())
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/sync-dhl", methods=["GET", "POST"])
+@require_api_key
+def sync_dhl():
+    """Akis 2: zip -> ABDtoDHL + Zendesk (ayri Cloud Scheduler)"""
+    log.info("Sync-DHL basladi (remote=%s)", request.remote_addr)
+    try:
+        from abd_to_dhl import run_dhl_batch
+
+        result = run_dhl_batch()
+        log.info("Sync-DHL bitti: %s", result)
+        return jsonify({"ok": True, **result}), 200
+    except Exception as exc:  # noqa: BLE001
+        log.error("Sync-DHL hata: %s\n%s", exc, traceback.format_exc())
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 
