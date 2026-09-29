@@ -1,0 +1,70 @@
+# Cloud Build -> Artifact Registry -> Cloud Run
+#
+# Trigger (Console): Cloud Build > Triggers > connect repo > cloudbuild.yaml
+# Manuel:
+#   gcloud builds submit --config cloudbuild.yaml .
+#
+# Substitutions (trigger veya CLI ile degistirilebilir):
+#   _REGION=europe-west1
+#   _SERVICE=abd-erstellung
+#   _REPO=abd-erstellung
+
+substitutions:
+  _REGION: europe-west1
+  _SERVICE: abd-erstellung
+  _REPO: abd-erstellung
+
+steps:
+  # 1) Image build
+  - name: gcr.io/cloud-builders/docker
+    id: build
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:latest
+      - .
+
+  # 2) Push (sha + latest)
+  - name: gcr.io/cloud-builders/docker
+    id: push-sha
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA
+    waitFor: [build]
+
+  - name: gcr.io/cloud-builders/docker
+    id: push-latest
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:latest
+    waitFor: [build]
+
+  # 3) Cloud Run deploy (mevcut env/secret'lar Console'dakiler korunur)
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    id: deploy
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE}
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA
+      - --region=${_REGION}
+      - --platform=managed
+      - --allow-unauthenticated
+      - --memory=1Gi
+      - --cpu=1
+      - --timeout=3600
+      - --concurrency=1
+      - --max-instances=1
+    waitFor: [push-sha]
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:latest
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 1200s

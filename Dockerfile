@@ -14,7 +14,7 @@ RUN apt-get update \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY abd_sync.py app.py ./
+COPY abd_sync.py abd_to_dhl.py app.py ./
 
 # Non-root
 RUN useradd -m -u 10001 appuser
