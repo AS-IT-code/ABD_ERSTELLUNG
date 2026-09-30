@@ -4,7 +4,7 @@
 # Manuel:
 #   gcloud builds submit --config cloudbuild.yaml .
 #
-# Substitutions (trigger veya CLI ile degistirilebilir):
+# Substitutions (opsiyonel):
 #   _REGION=europe-west1
 #   _SERVICE=abd-erstellung
 #   _REPO=abd-erstellung
@@ -15,23 +15,23 @@ substitutions:
   _REPO: abd-erstellung
 
 steps:
-  # 1) Image build
+  # 1) Image build ($BUILD_ID her zaman dolu; $SHORT_SHA sadece repo trigger'da)
   - name: gcr.io/cloud-builders/docker
     id: build
     args:
       - build
       - -t
-      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$BUILD_ID
       - -t
       - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:latest
       - .
 
-  # 2) Push (sha + latest)
+  # 2) Push
   - name: gcr.io/cloud-builders/docker
-    id: push-sha
+    id: push-id
     args:
       - push
-      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$BUILD_ID
     waitFor: [build]
 
   - name: gcr.io/cloud-builders/docker
@@ -41,7 +41,7 @@ steps:
       - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:latest
     waitFor: [build]
 
-  # 3) Cloud Run deploy (mevcut env/secret'lar Console'dakiler korunur)
+  # 3) Cloud Run deploy (Console'daki env/secret'lar korunur)
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk
     id: deploy
     entrypoint: gcloud
@@ -49,7 +49,7 @@ steps:
       - run
       - deploy
       - ${_SERVICE}
-      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$BUILD_ID
       - --region=${_REGION}
       - --platform=managed
       - --allow-unauthenticated
@@ -58,10 +58,10 @@ steps:
       - --timeout=3600
       - --concurrency=1
       - --max-instances=1
-    waitFor: [push-sha]
+    waitFor: [push-id]
 
 images:
-  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$BUILD_ID
   - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:latest
 
 options:
