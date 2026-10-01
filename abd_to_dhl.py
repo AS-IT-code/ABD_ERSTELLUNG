@@ -211,9 +211,13 @@ def create_dhl_ticket(base: str, auth: tuple[str, str], zip_paths: list[Path]) -
     tag = env("ticket_tag", "TICKET_TAG", required=False)
     type_field_id = env("CUSTOM_TICKET_TYPE_FIELD_ID", required=False)
     type_field_value = env("CUSTOM_TICKET_TYPE_FIELD_VALUE", required=False)
-    # Solved icin zorunlu custom field'lar (N/A)
-    na_id = env("custom_N/A_id", "CUSTOM_NA_ID", required=False)
-    na_id2 = env("custom_N/A_id2", "CUSTOM_NA_ID2", required=False)
+    # Solved zorunlu text field'lar (Cloud Run'da /'li env okunmayabilir -> sabit ID fallback)
+    na_id = (
+        env("CUSTOM_NA_ID", "custom_N/A_id", required=False) or "24929440954012"
+    )
+    na_id2 = (
+        env("CUSTOM_NA_ID2", "custom_N/A_id2", required=False) or "16374006240284"
+    )
     na_value = env("CUSTOM_NA_VALUE", required=False) or "N/A"
 
     ticket: dict = {
@@ -240,12 +244,13 @@ def create_dhl_ticket(base: str, auth: tuple[str, str], zip_paths: list[Path]) -
     custom_fields = []
     if type_field_id and type_field_value and type_field_id.isdigit():
         custom_fields.append({"id": int(type_field_id), "value": type_field_value})
-    if na_id and na_id.isdigit():
+    # Solved icin her zaman N/A yaz (eksikse 422)
+    if na_id.isdigit():
         custom_fields.append({"id": int(na_id), "value": na_value})
-    if na_id2 and na_id2.isdigit():
+    if na_id2.isdigit():
         custom_fields.append({"id": int(na_id2), "value": na_value})
-    if custom_fields:
-        ticket["custom_fields"] = custom_fields
+    ticket["custom_fields"] = custom_fields
+    print(f"  Solved custom fields: {custom_fields}")
 
     resp = requests.post(f"{base}/tickets.json", auth=auth, json={"ticket": ticket}, timeout=180)
     if resp.status_code >= 400:
