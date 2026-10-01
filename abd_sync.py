@@ -121,7 +121,8 @@ def drive_item_url(filename: str, *, subfolder: str | None = None) -> str:
 
 def month_folder_from_text(text: str) -> str | None:
     """
-    'Auftrag 250926102929102450 ABD Erstellung' -> ilk 6 hane DDMMYY -> '2026-09'
+    Eski fallback: 'Auftrag 250926...' -> ilk 6 hane DDMMYY -> '2026-09'
+    Tercihen month_folder_from_ticket(created_at) kullan.
     """
     match = re.search(r"(\d{6,})", text or "")
     if not match:
@@ -137,6 +138,17 @@ def month_folder_from_text(text: str) -> str | None:
         return None
     yyyy = 2000 + yy if yy < 100 else yy
     return f"{yyyy:04d}-{mm:02d}"
+
+
+def month_folder_from_ticket(ticket: dict) -> str | None:
+    """Kaynak ticket created_at -> YYYY-MM (PDF ne zaman gelirse gelsin)."""
+    created = (ticket.get("created_at") or "").strip()
+    if len(created) >= 7 and created[4] == "-" and created[7] == "-":
+        return created[:7]
+    # ISO olmadan sadece tarih
+    if len(created) >= 7 and created[4] == "-":
+        return created[:7]
+    return None
 
 
 def ensure_month_folder(token: str, yyyy_mm: str, cache: dict[str, str] | None = None) -> str:
@@ -388,9 +400,16 @@ def run_sync() -> dict:
                     continue
 
                 remote_name = pdf_name_from_subject(subject)
-                month_folder = month_folder_from_text(subject) or month_folder_from_text(remote_name)
+                # Klasor: ticket created_at ayi (PDF bugun gelse bile)
+                month_folder = (
+                    month_folder_from_ticket(ticket)
+                    or month_folder_from_text(subject)
+                    or month_folder_from_text(remote_name)
+                )
                 if not month_folder:
-                    print("  Uyari: tarih (DDMMYY) okunamadi -> kok klasore yuklenecek")
+                    print("  Uyari: ay klasoru belirlenemedi -> kok klasore yuklenecek")
+                else:
+                    print(f"  Ay klasoru (ticket created): {month_folder}")
 
                 any_uploaded = False
                 existed_here = False

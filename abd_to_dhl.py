@@ -195,6 +195,69 @@ def build_mail_copy(zip_paths: list[Path]) -> tuple[str, str]:
     return MAIL_SUBJECT_MULTI, MAIL_BODY_MULTI
 
 
+def solved_na_custom_fields() -> list[dict]:
+    """Solved zorunlu N/A field'lari (+ opsiyonel ticket type)."""
+    type_field_id = env("CUSTOM_TICKET_TYPE_FIELD_ID", required=False)
+    type_field_value = env("CUSTOM_TICKET_TYPE_FIELD_VALUE", required=False)
+    na_id = env("CUSTOM_NA_ID", "custom_N/A_id", required=False) or "24929440954012"
+    na_id2 = env("CUSTOM_NA_ID2", "custom_N/A_id2", required=False) or "16374006240284"
+    na_value = env("CUSTOM_NA_VALUE", required=False) or "N/A"
+
+    fields: list[dict] = []
+    if type_field_id and type_field_value and type_field_id.isdigit():
+        fields.append({"id": int(type_field_id), "value": type_field_value})
+    if na_id.isdigit():
+        fields.append({"id": int(na_id), "value": na_value})
+    if na_id2.isdigit():
+        fields.append({"id": int(na_id2), "value": na_value})
+    return fields
+
+
+def solve_source_ticket(
+    base: str,
+    auth: tuple[str, str],
+    source_ticket_id: str,
+    *,
+    dhl_ticket_id: int | str | None = None,
+) -> None:
+    """
+    Kaynak ABD Erstellung ticket'ini solved kapat.
+    CUSTOM_NA_ID / CUSTOM_NA_ID2 = N/A
+    """
+    agent_id = env("AGENT_ID", required=False)
+    custom_fields = solved_na_custom_fields()
+
+    note = "ABD documents packaged and sent to DHL."
+    if dhl_ticket_id:
+        note = f"ABD documents packaged and sent to DHL (ticket #{dhl_ticket_id})."
+
+    ticket: dict = {
+        "status": "solved",
+        "custom_fields": custom_fields,
+        "comment": {
+            "body": note,
+            "public": False,
+        },
+    }
+    if agent_id and agent_id.isdigit():
+        aid = int(agent_id)
+        ticket["assignee_id"] = aid
+        ticket["comment"]["author_id"] = aid
+
+    resp = requests.put(
+        f"{base}/tickets/{source_ticket_id}.json",
+        auth=auth,
+        json={"ticket": ticket},
+        timeout=120,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(
+            f"Source ticket #{source_ticket_id} solve failed "
+            f"{resp.status_code}: {resp.text[:500]}"
+        )
+    print(f"  Kaynak ticket solved: #{source_ticket_id} (N/A fields + closed)")
+
+
 def create_dhl_ticket(base: str, auth: tuple[str, str], zip_paths: list[Path]) -> dict:
     """Yeni Zendesk ticket: public reply + zip, status solved."""
     if not zip_paths:
@@ -209,16 +272,7 @@ def create_dhl_ticket(base: str, auth: tuple[str, str], zip_paths: list[Path]) -
     agent_name = env("AGENT_NAME", required=False) or "Asya Yildirim"
     group_id = env("GroupID", "GROUP_ID", required=False)
     tag = env("ticket_tag", "TICKET_TAG", required=False)
-    type_field_id = env("CUSTOM_TICKET_TYPE_FIELD_ID", required=False)
-    type_field_value = env("CUSTOM_TICKET_TYPE_FIELD_VALUE", required=False)
-    # Solved zorunlu text field'lar (Cloud Run'da /'li env okunmayabilir -> sabit ID fallback)
-    na_id = (
-        env("CUSTOM_NA_ID", "custom_N/A_id", required=False) or "24929440954012"
-    )
-    na_id2 = (
-        env("CUSTOM_NA_ID2", "custom_N/A_id2", required=False) or "16374006240284"
-    )
-    na_value = env("CUSTOM_NA_VALUE", required=False) or "N/A"
+    custom_fields = solved_na_custom_fields()
 
     ticket: dict = {
         "subject": subject,
@@ -229,27 +283,19 @@ def create_dhl_ticket(base: str, auth: tuple[str, str], zip_paths: list[Path]) -
             "public": True,
             "uploads": upload_tokens,
         },
+        "custom_fields": custom_fields,
     }
 
     if agent_id and agent_id.isdigit():
         aid = int(agent_id)
         ticket["assignee_id"] = aid
-        ticket["submitter_id"] = aid  # ticket'i agent acmis gibi
-        ticket["comment"]["author_id"] = aid  # public reply gonderen = AGENT
+        ticket["submitter_id"] = aid
+        ticket["comment"]["author_id"] = aid
     if group_id and group_id.isdigit():
         ticket["group_id"] = int(group_id)
     if tag:
         ticket["tags"] = [t.strip() for t in tag.split(",") if t.strip()]
 
-    custom_fields = []
-    if type_field_id and type_field_value and type_field_id.isdigit():
-        custom_fields.append({"id": int(type_field_id), "value": type_field_value})
-    # Solved icin her zaman N/A yaz (eksikse 422)
-    if na_id.isdigit():
-        custom_fields.append({"id": int(na_id), "value": na_value})
-    if na_id2.isdigit():
-        custom_fields.append({"id": int(na_id2), "value": na_value})
-    ticket["custom_fields"] = custom_fields
     print(f"  Solved custom fields: {custom_fields}")
 
     resp = requests.post(f"{base}/tickets.json", auth=auth, json={"ticket": ticket}, timeout=180)
@@ -388,10 +434,15 @@ def process_ticket(ticket_id: str, *, force: bool = False) -> dict:
         zip_path = Path(result["zip_path"])
         print("  Zendesk ticket (public reply + zip, solved) aciliyor...")
         created = create_dhl_ticket(zd_base, zd_auth, [zip_path])
+        dhl_id = created.get("id")
+
+        print(f"  Kaynak ABD ticket kapatiliyor: #{ticket_id}")
+        solve_source_ticket(zd_base, zd_auth, ticket_id, dhl_ticket_id=dhl_id)
 
         processed.add(ticket_id)
         save_processed_dhl(token, folder_id, processed)
-        result["zendesk_ticket_id"] = created.get("id")
+        result["zendesk_ticket_id"] = dhl_id
+        result["source_solved"] = True
         return result
 
 
@@ -470,12 +521,22 @@ def run_dhl_batch() -> dict:
                 print(f"  HATA (DHL): {exc}")
 
         zendesk_ticket_id = None
+        source_solved = 0
         if zip_paths:
             print(f"\n  Zendesk ticket (public reply + solved) aciliyor ({len(zip_paths)} zip)...")
             created = create_dhl_ticket(zd_base, zd_auth, zip_paths)
             zendesk_ticket_id = created.get("id")
             for tid in ready_source_ids:
-                processed.add(tid)
+                try:
+                    print(f"  Kaynak ABD ticket kapatiliyor: #{tid}")
+                    solve_source_ticket(
+                        zd_base, zd_auth, tid, dhl_ticket_id=zendesk_ticket_id
+                    )
+                    source_solved += 1
+                    processed.add(tid)
+                except Exception as exc:  # noqa: BLE001
+                    errors += 1
+                    print(f"  HATA kaynak solve #{tid}: {exc}")
             save_processed_dhl(token, folder_id, processed)
         else:
             print("\n  Gonderilecek zip yok; Zendesk ticket acilmadi.")
@@ -487,6 +548,7 @@ def run_dhl_batch() -> dict:
         "dhl_errors": errors,
         "dhl_zendesk_ticket_id": zendesk_ticket_id,
         "dhl_zip_count": len(ready_source_ids),
+        "dhl_source_solved": source_solved,
         "dhl_since": since,
         "mail_mode": (
             "single" if len(ready_source_ids) == 1 else ("multi" if ready_source_ids else "none")
